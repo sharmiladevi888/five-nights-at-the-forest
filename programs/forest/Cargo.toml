@@ -1,0 +1,19 @@
+[package]
+name = "forest"
+version = "0.1.0"
+description = "Score registry + admin-gated airdrop for Five Nights at the Forest"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "forest"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+
+[dependencies]
+anchor-lang = "0.30.1"
