@@ -1,0 +1,46 @@
+// Postgres in prod (set DATABASE_URL). SQLite works locally out of the box.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Player {
+  id           String   @id @default(cuid())
+  wallet       String   @unique
+  referralCode String   @unique
+  referredById String?
+  referredBy   Player?  @relation("Referrals", fields: [referredById], references: [id])
+  referrals    Player[] @relation("Referrals")
+  highScore    Int      @default(0)
+  nightsCleared Int     @default(0)
+  sessions     Session[]
+  airdrops     Airdrop[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Session {
+  id             String   @id @default(cuid())
+  player         Player   @relation(fields: [playerId], references: [id])
+  playerId       String
+  score          Int
+  nightsCleared  Int
+  secondsSurvived Int
+  creaturesEvaded Int
+  itemsCollected Int
+  createdAt      DateTime @default(now())
+}
+
+model Airdrop {
+  id        String   @id @default(cuid())
+  player    Player   @relation(fields: [playerId], references: [id])
+  playerId  String
+  wallet    String
+  amount    Int
+  txSignature String?
+  createdAt DateTime @default(now())
+}
