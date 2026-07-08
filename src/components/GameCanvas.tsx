@@ -10,6 +10,7 @@ interface Hud {
   battery: number;
   health: number;
   score: number;
+  block: string;
 }
 
 export default function GameCanvas() {
@@ -59,23 +60,21 @@ export default function GameCanvas() {
       <div className="relative w-[800px] h-[500px] rounded overflow-hidden border border-forest-700">
         <div ref={containerRef} className="absolute inset-0" />
 
-        {/* HUD overlay */}
         {started && hud && !result && (
           <div className="absolute top-3 left-3 font-mono text-forest-300 text-sm leading-6 pointer-events-none">
             <div>NIGHT {hud.night}/5 · {hud.time}s</div>
             <div>BATTERY {hud.battery}% · HP {hud.health}</div>
             <div>SCORE {hud.score}</div>
+            <div className="text-forest-300/70">BLOCK: {hud.block?.toUpperCase()} (1-4)</div>
           </div>
         )}
 
-        {/* crosshair */}
         {started && !result && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <div className="w-1 h-1 bg-forest-300/80 rounded-full" />
+            <div className="w-4 h-4 border border-white/70 rounded-sm" />
           </div>
         )}
 
-        {/* start gate */}
         {!started && (
           <button
             onClick={() => setStarted(true)}
@@ -83,10 +82,10 @@ export default function GameCanvas() {
           >
             <span className="text-2xl font-bold mb-2">▶ Enter the Forest</span>
             <span className="text-sm text-forest-300/70">Click to play · WASD move · mouse look</span>
+            <span className="text-xs text-forest-300/50 mt-1">Left-click break · right-click place · 1-4 pick block</span>
           </button>
         )}
 
-        {/* game over */}
         {result && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-forest-900/85 text-center px-6">
             {!submitted ? (
@@ -112,7 +111,7 @@ export default function GameCanvas() {
         )}
       </div>
       <p className="text-forest-300/50 text-xs font-mono">
-        Click the window to capture your mouse. Esc to release.
+        Click to capture mouse · WASD move · left-click break · right-click place · 1-4 select block · Esc release
       </p>
     </div>
   );
