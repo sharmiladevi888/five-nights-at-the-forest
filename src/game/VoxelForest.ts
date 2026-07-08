@@ -3,19 +3,26 @@ import type { RunStats } from "@/lib/score";
 import { heightAt, treeAt } from "./noise";
 
 // First-person 3D voxel survival with block breaking/placing on INFINITE,
-// procedurally generated terrain. The world streams in as chunks around the
-// player: a seeded value-noise heightmap gives rolling hills, dirt/stone
-// layers, and scattered blocky trees. Chunks load within a radius and unload
-// as you walk away, so there are no world edges.
+// procedurally generated terrain, now with real vertical physics: velocity-
+// based gravity, spacebar jump, and proper ground/ceiling collision. You can
+// stack blocks and jump up to climb the terrain you build.
 //
-// Player edits (break/place) are stored per-coordinate and override generated
-// terrain, and they persist while their chunk is loaded.
+// The world streams in as chunks around the player: a seeded value-noise
+// heightmap gives rolling hills, dirt/stone layers, and scattered blocky
+// trees. Player edits (break/place) override generated terrain.
 
 const BLOCK = 2;
 const REACH = 6;
-const CHUNK = 8; // blocks per chunk edge
-const RADIUS = 3; // chunks loaded in each direction from player
+const CHUNK = 8;
+const RADIUS = 3;
 const SEED = 1337;
+
+// physics (world units). EYE is how high the camera sits above the player's
+// feet; the body is ~1.6 blocks tall.
+const GRAVITY = 34; // units/s^2
+const JUMP_V = 11; // initial jump velocity
+const EYE = BLOCK * 0.8;
+const PLAYER_H = BLOCK * 1.6;
 
 type BlockType = "dirt" | "trunk" | "leaf" | "stone" | "grass";
 
@@ -43,9 +50,7 @@ export class VoxelForest {
   private lantern!: THREE.PointLight;
   private fog!: THREE.FogExp2;
 
-  // player edits override generation. value=null means "mined away".
   private edits = new Map<string, BlockType | null>();
-  // loaded chunks: chunk key -> its meshes
   private chunks = new Map<string, THREE.InstancedMesh[]>();
   private highlight!: THREE.LineSegments;
 
@@ -55,7 +60,9 @@ export class VoxelForest {
   private keys: Record<string, boolean> = {};
   private yaw = 0;
   private pitch = 0;
-  private pos = new THREE.Vector3(0, 24, 0);
+  private pos = new THREE.Vector3(0, 24, 0); // camera (eye) position
+  private velY = 0; // vertical velocity
+  private onGround = false;
   private selected: BlockType = "stone";
   private lastChunk = "";
 
@@ -113,8 +120,8 @@ export class VoxelForest {
     this.lantern = new THREE.PointLight(0xffca6a, 2.2, 26, 1.6);
     this.scene.add(this.lantern);
 
-    // drop the player onto the surface at origin
-    this.pos.y = (heightAt(0, 0, SEED) + 3) * BLOCK;
+    // spawn standing on the surface at origin
+    this.pos.y = (heightAt(0, 0, SEED) + 1) * BLOCK + BLOCK / 2 + EYE;
 
     this.buildHighlight();
     this.refreshChunks(true);
@@ -127,36 +134,27 @@ export class VoxelForest {
 
   // ---- terrain generation ----
 
-  // Resolve the block at a world coord: player edits win, else generated.
   private blockAt(x: number, y: number, z: number): BlockType | null {
     const e = this.edits.get(bkey(x, y, z));
-    if (e !== undefined) return e; // may be null (mined) or a type (placed)
+    if (e !== undefined) return e;
     return this.generated(x, y, z);
   }
 
-  // Pure procedural terrain (no edits): grass cap, dirt below, stone deep.
   private generated(x: number, y: number, z: number): BlockType | null {
     if (y < 0) return null;
     const h = heightAt(x, z, SEED);
-    if (y > h) {
-      // possible tree above the surface
-      return this.treeBlock(x, y, z, h);
-    }
+    if (y > h) return this.treeBlock(x, y, z, h);
     if (y === h) return "grass";
     if (y >= h - 2) return "dirt";
     return "stone";
   }
 
-  // Trees are generated deterministically from the column's surface height.
   private treeBlock(x: number, y: number, z: number, h: number): BlockType | null {
-    // trunk
     if (treeAt(x, z, SEED)) {
       const trunkTop = h + 4;
       if (y > h && y <= trunkTop) return "trunk";
-      // leaf cap around trunk top
       if (y >= trunkTop && y <= trunkTop + 1) return "leaf";
     }
-    // leaves from neighbouring trunks (3x3 cap)
     for (let dx = -1; dx <= 1; dx++)
       for (let dz = -1; dz <= 1; dz++) {
         if (dx === 0 && dz === 0) continue;
@@ -169,7 +167,6 @@ export class VoxelForest {
     return null;
   }
 
-  // A block is visible only if at least one face is exposed (neighbour empty).
   private exposed(x: number, y: number, z: number): boolean {
     return (
       this.blockAt(x + 1, y, z) === null ||
@@ -181,7 +178,6 @@ export class VoxelForest {
     );
   }
 
-  // Build the instanced meshes for one chunk (only exposed blocks).
   private buildChunk(cx: number, cz: number): THREE.InstancedMesh[] {
     const buckets: Record<BlockType, THREE.Matrix4[]> = {
       dirt: [], grass: [], trunk: [], leaf: [], stone: [],
@@ -192,7 +188,6 @@ export class VoxelForest {
         const x = cx * CHUNK + lx;
         const z = cz * CHUNK + lz;
         const h = heightAt(x, z, SEED);
-        // scan a vertical band around the surface (+ headroom for trees)
         for (let y = Math.max(0, h - 4); y <= h + 6; y++) {
           const t = this.blockAt(x, y, z);
           if (!t) continue;
@@ -230,7 +225,6 @@ export class VoxelForest {
     this.chunks.delete(key);
   }
 
-  // Load chunks around the player, unload distant ones. Called on chunk change.
   private refreshChunks(force = false) {
     const pcx = Math.floor(this.pos.x / BLOCK / CHUNK);
     const pcz = Math.floor(this.pos.z / BLOCK / CHUNK);
@@ -247,13 +241,11 @@ export class VoxelForest {
         needed.add(k);
         if (!this.chunks.has(k)) this.chunks.set(k, this.buildChunk(cx, cz));
       }
-    // unload chunks no longer needed
     for (const k of [...this.chunks.keys()]) {
       if (!needed.has(k)) this.disposeChunk(k);
     }
   }
 
-  // Rebuild just the chunk containing a block, plus neighbours if on a seam.
   private rebuildAround(x: number, z: number) {
     const cx = Math.floor(x / CHUNK);
     const cz = Math.floor(z / CHUNK);
@@ -283,14 +275,15 @@ export class VoxelForest {
     this.items = [];
 
     const count = 2 + this.night;
-    const surfaceY = (heightAt(Math.round(this.pos.x / BLOCK), Math.round(this.pos.z / BLOCK), SEED) + 2) * BLOCK;
     const geo = new THREE.BoxGeometry(BLOCK * 0.9, BLOCK * 1.6, BLOCK * 0.9);
     for (let i = 0; i < count; i++) {
       const mat = new THREE.MeshStandardMaterial({ color: 0x140606, emissive: 0x330000, emissiveIntensity: 0.6 });
       const cr = new THREE.Mesh(geo, mat);
       const ang = Math.random() * Math.PI * 2;
       const dist = 22 + Math.random() * 24;
-      cr.position.set(this.pos.x + Math.cos(ang) * dist, surfaceY, this.pos.z + Math.sin(ang) * dist);
+      const cxp = this.pos.x + Math.cos(ang) * dist;
+      const czp = this.pos.z + Math.sin(ang) * dist;
+      cr.position.set(cxp, this.surfaceY(cxp, czp) + BLOCK * 0.8, czp);
       const eyeGeo = new THREE.BoxGeometry(0.3, 0.3, 0.1);
       const eyeMat = new THREE.MeshBasicMaterial({ color: 0xff2b2b });
       const e1 = new THREE.Mesh(eyeGeo, eyeMat);
@@ -309,7 +302,9 @@ export class VoxelForest {
       const it = new THREE.Mesh(itemGeo, mat);
       const ang = Math.random() * Math.PI * 2;
       const dist = 8 + Math.random() * 26;
-      it.position.set(this.pos.x + Math.cos(ang) * dist, surfaceY, this.pos.z + Math.sin(ang) * dist);
+      const ixp = this.pos.x + Math.cos(ang) * dist;
+      const izp = this.pos.z + Math.sin(ang) * dist;
+      it.position.set(ixp, this.surfaceY(ixp, izp) + BLOCK * 0.6, izp);
       this.scene.add(it);
       this.items.push(it);
     }
@@ -338,6 +333,11 @@ export class VoxelForest {
       this.keys[e.code] = true;
       const idx = ["Digit1", "Digit2", "Digit3", "Digit4"].indexOf(e.code);
       if (idx >= 0) this.selected = PLACEABLE[idx];
+      // jump
+      if (e.code === "Space" && this.onGround) {
+        this.velY = JUMP_V;
+        this.onGround = false;
+      }
     };
     this._onUp = (e: KeyboardEvent) => (this.keys[e.code] = false);
     document.addEventListener("mousemove", this._onMove);
@@ -405,33 +405,40 @@ export class VoxelForest {
     const pz = z + Math.round(nz);
     if (py < 1) return;
     if (this.blockAt(px, py, pz) !== null) return;
+    // don't place inside the player's own body column
     const feetX = Math.round(this.pos.x / BLOCK);
     const feetZ = Math.round(this.pos.z / BLOCK);
-    const feetY = Math.round((this.pos.y - BLOCK / 2) / BLOCK);
-    if (px === feetX && pz === feetZ && (py === feetY || py === feetY - 1)) return;
+    const feetY = Math.floor((this.pos.y - EYE) / BLOCK);
+    if (px === feetX && pz === feetZ && (py === feetY || py === feetY + 1)) return;
     this.edits.set(bkey(px, py, pz), this.selected);
     this.rebuildAround(px, pz);
   }
 
-  // ---- collision + gravity against generated + edited terrain ----
+  // ---- collision helpers ----
 
-  private solidAt(wx: number, wy: number, wz: number): boolean {
-    const gx = Math.round(wx / BLOCK);
-    const gy = Math.round((wy - BLOCK / 2) / BLOCK);
-    const gz = Math.round(wz / BLOCK);
+  private solidCell(gx: number, gy: number, gz: number): boolean {
     return this.blockAt(gx, gy, gz) !== null;
   }
 
-  // surface height (world units) at a world x/z, for gravity/standing
-  private groundY(wx: number, wz: number): number {
+  // Is the player's body blocked at eye position `eyeY` and x/z? Checks the two
+  // cells the ~1.6-block-tall body occupies (feet + head).
+  private bodyBlocked(wx: number, eyeY: number, wz: number): boolean {
     const gx = Math.round(wx / BLOCK);
     const gz = Math.round(wz / BLOCK);
-    // find topmost solid at/above generated height (accounts for placed blocks)
+    const feetY = Math.floor((eyeY - EYE) / BLOCK);
+    const headY = Math.floor((eyeY - EYE + PLAYER_H) / BLOCK);
+    return this.solidCell(gx, feetY, gz) || this.solidCell(gx, headY, gz);
+  }
+
+  // Topmost solid surface (world Y of its top face) at a world x/z.
+  private surfaceY(wx: number, wz: number): number {
+    const gx = Math.round(wx / BLOCK);
+    const gz = Math.round(wz / BLOCK);
     let top = heightAt(gx, gz, SEED);
-    for (let y = top + 6; y >= 0; y--) {
+    for (let y = top + 8; y >= 0; y--) {
       if (this.blockAt(gx, y, gz) !== null) { top = y; break; }
     }
-    return (top + 1) * BLOCK + BLOCK / 2; // eye height one block above surface
+    return (top + 1) * BLOCK; // top face of the highest block
   }
 
   private tickSecond() {
@@ -461,6 +468,7 @@ export class VoxelForest {
     }
     if (this.ended) return;
 
+    // ---- horizontal movement with collision ----
     const speed = 8 * dt;
     const fwd = new THREE.Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw));
     const right = new THREE.Vector3(fwd.z, 0, -fwd.x);
@@ -470,15 +478,34 @@ export class VoxelForest {
     if (this.keys["KeyS"]) { nx += fwd.x * speed; nz += fwd.z * speed; }
     if (this.keys["KeyA"]) { nx -= right.x * speed; nz -= right.z * speed; }
     if (this.keys["KeyD"]) { nx += right.x * speed; nz += right.z * speed; }
-    // horizontal collision at torso height
-    if (!this.solidAt(nx, this.pos.y - BLOCK, this.pos.z)) this.pos.x = nx;
-    if (!this.solidAt(this.pos.x, this.pos.y - BLOCK, nz)) this.pos.z = nz;
+    if (!this.bodyBlocked(nx, this.pos.y, this.pos.z)) this.pos.x = nx;
+    if (!this.bodyBlocked(this.pos.x, this.pos.y, nz)) this.pos.z = nz;
 
-    // stick to the ground surface (simple step-up/step-down, no jumping)
-    const targetY = this.groundY(this.pos.x, this.pos.z);
-    this.pos.y += (targetY - this.pos.y) * Math.min(1, dt * 12);
+    // ---- vertical physics: gravity + jump + ground/ceiling collision ----
+    this.velY -= GRAVITY * dt;
+    let nextY = this.pos.y + this.velY * dt;
 
-    // stream terrain if we crossed into a new chunk
+    const ground = this.surfaceY(this.pos.x, this.pos.z); // top face of terrain
+    const feetTargetEye = ground + EYE; // eye height when standing on surface
+
+    if (this.velY <= 0 && nextY <= feetTargetEye) {
+      // landed / standing on the surface
+      nextY = feetTargetEye;
+      this.velY = 0;
+      this.onGround = true;
+    } else {
+      this.onGround = false;
+      // ceiling bonk: if head would enter a solid block, stop upward motion
+      const headCellY = Math.floor((nextY - EYE + PLAYER_H) / BLOCK);
+      const gx = Math.round(this.pos.x / BLOCK);
+      const gz = Math.round(this.pos.z / BLOCK);
+      if (this.velY > 0 && this.solidCell(gx, headCellY, gz)) {
+        this.velY = 0;
+        nextY = this.pos.y;
+      }
+    }
+    this.pos.y = nextY;
+
     this.refreshChunks();
 
     this.camera.position.set(this.pos.x, this.pos.y, this.pos.z);
@@ -500,8 +527,7 @@ export class VoxelForest {
       to.normalize();
       cr.position.x += to.x * (cr as any).speed * dt;
       cr.position.z += to.z * (cr as any).speed * dt;
-      // keep creatures on the surface
-      cr.position.y = this.groundY(cr.position.x, cr.position.z) - BLOCK * 0.2;
+      cr.position.y = this.surfaceY(cr.position.x, cr.position.z) + BLOCK * 0.8;
       cr.rotation.y = Math.atan2(to.x, to.z);
       if (d < 1.6) {
         this.health -= 34;
@@ -515,7 +541,7 @@ export class VoxelForest {
     for (let i = this.items.length - 1; i >= 0; i--) {
       const it = this.items[i];
       it.rotation.y += dt * 2;
-      const baseY = this.groundY(it.position.x, it.position.z) - BLOCK * 0.3;
+      const baseY = this.surfaceY(it.position.x, it.position.z) + BLOCK * 0.6;
       it.position.y = baseY + Math.sin(performance.now() / 400 + i) * 0.2;
       const dx = it.position.x - this.pos.x;
       const dz = it.position.z - this.pos.z;
