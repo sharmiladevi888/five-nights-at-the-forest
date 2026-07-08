@@ -3,13 +3,13 @@ import type { RunStats } from "@/lib/score";
 import { heightAt, treeAt } from "./noise";
 
 // First-person 3D voxel survival with block breaking/placing on INFINITE,
-// procedurally generated terrain, now with real vertical physics: velocity-
-// based gravity, spacebar jump, and proper ground/ceiling collision. You can
-// stack blocks and jump up to climb the terrain you build.
+// procedurally generated terrain, plus real vertical physics: gravity, a
+// spacebar jump, and block-aware landing + head-bump. You can now climb
+// hills and towers you build, and fall off ledges.
 //
-// The world streams in as chunks around the player: a seeded value-noise
-// heightmap gives rolling hills, dirt/stone layers, and scattered blocky
-// trees. Player edits (break/place) override generated terrain.
+// The world streams in as chunks around the player; a seeded value-noise
+// heightmap gives rolling hills, dirt/stone layers, and scattered trees.
+// Player edits (break/place) override generated terrain while loaded.
 
 const BLOCK = 2;
 const REACH = 6;
@@ -17,12 +17,11 @@ const CHUNK = 8;
 const RADIUS = 3;
 const SEED = 1337;
 
-// physics (world units). EYE is how high the camera sits above the player's
-// feet; the body is ~1.6 blocks tall.
-const GRAVITY = 34; // units/s^2
-const JUMP_V = 11; // initial jump velocity
-const EYE = BLOCK * 0.8;
-const PLAYER_H = BLOCK * 1.6;
+// physics tuning (world units)
+const GRAVITY = 34; // downward accel
+const JUMP_V = 12; // initial jump velocity (~1.1 blocks of rise)
+const EYE = BLOCK * 1.6; // eye height above the block the player stands on
+const PLAYER_H = BLOCK * 1.6; // body height for head-bump checks
 
 type BlockType = "dirt" | "trunk" | "leaf" | "stone" | "grass";
 
@@ -60,8 +59,8 @@ export class VoxelForest {
   private keys: Record<string, boolean> = {};
   private yaw = 0;
   private pitch = 0;
-  private pos = new THREE.Vector3(0, 24, 0); // camera (eye) position
-  private velY = 0; // vertical velocity
+  private pos = new THREE.Vector3(0, 24, 0);
+  private velocityY = 0;
   private onGround = false;
   private selected: BlockType = "stone";
   private lastChunk = "";
@@ -120,8 +119,8 @@ export class VoxelForest {
     this.lantern = new THREE.PointLight(0xffca6a, 2.2, 26, 1.6);
     this.scene.add(this.lantern);
 
-    // spawn standing on the surface at origin
-    this.pos.y = (heightAt(0, 0, SEED) + 1) * BLOCK + BLOCK / 2 + EYE;
+    // drop the player onto the surface at origin
+    this.pos.y = (heightAt(0, 0, SEED) + 1) * BLOCK + EYE;
 
     this.buildHighlight();
     this.refreshChunks(true);
@@ -281,9 +280,9 @@ export class VoxelForest {
       const cr = new THREE.Mesh(geo, mat);
       const ang = Math.random() * Math.PI * 2;
       const dist = 22 + Math.random() * 24;
-      const cxp = this.pos.x + Math.cos(ang) * dist;
-      const czp = this.pos.z + Math.sin(ang) * dist;
-      cr.position.set(cxp, this.surfaceY(cxp, czp) + BLOCK * 0.8, czp);
+      const cx = this.pos.x + Math.cos(ang) * dist;
+      const cz = this.pos.z + Math.sin(ang) * dist;
+      cr.position.set(cx, this.surfaceTop(cx, cz) + BLOCK * 0.8, cz);
       const eyeGeo = new THREE.BoxGeometry(0.3, 0.3, 0.1);
       const eyeMat = new THREE.MeshBasicMaterial({ color: 0xff2b2b });
       const e1 = new THREE.Mesh(eyeGeo, eyeMat);
@@ -302,9 +301,9 @@ export class VoxelForest {
       const it = new THREE.Mesh(itemGeo, mat);
       const ang = Math.random() * Math.PI * 2;
       const dist = 8 + Math.random() * 26;
-      const ixp = this.pos.x + Math.cos(ang) * dist;
-      const izp = this.pos.z + Math.sin(ang) * dist;
-      it.position.set(ixp, this.surfaceY(ixp, izp) + BLOCK * 0.6, izp);
+      const ix = this.pos.x + Math.cos(ang) * dist;
+      const iz = this.pos.z + Math.sin(ang) * dist;
+      it.position.set(ix, this.surfaceTop(ix, iz) + BLOCK * 0.6, iz);
       this.scene.add(it);
       this.items.push(it);
     }
@@ -335,7 +334,7 @@ export class VoxelForest {
       if (idx >= 0) this.selected = PLACEABLE[idx];
       // jump
       if (e.code === "Space" && this.onGround) {
-        this.velY = JUMP_V;
+        this.velocityY = JUMP_V;
         this.onGround = false;
       }
     };
@@ -405,10 +404,9 @@ export class VoxelForest {
     const pz = z + Math.round(nz);
     if (py < 1) return;
     if (this.blockAt(px, py, pz) !== null) return;
-    // don't place inside the player's own body column
     const feetX = Math.round(this.pos.x / BLOCK);
     const feetZ = Math.round(this.pos.z / BLOCK);
-    const feetY = Math.floor((this.pos.y - EYE) / BLOCK);
+    const feetY = Math.round((this.pos.y - EYE) / BLOCK);
     if (px === feetX && pz === feetZ && (py === feetY || py === feetY + 1)) return;
     this.edits.set(bkey(px, py, pz), this.selected);
     this.rebuildAround(px, pz);
@@ -416,29 +414,24 @@ export class VoxelForest {
 
   // ---- collision helpers ----
 
-  private solidCell(gx: number, gy: number, gz: number): boolean {
+  // is there a solid block at this world coord?
+  private solidWorld(wx: number, wy: number, wz: number): boolean {
+    const gx = Math.round(wx / BLOCK);
+    const gy = Math.round((wy - BLOCK / 2) / BLOCK);
+    const gz = Math.round(wz / BLOCK);
     return this.blockAt(gx, gy, gz) !== null;
   }
 
-  // Is the player's body blocked at eye position `eyeY` and x/z? Checks the two
-  // cells the ~1.6-block-tall body occupies (feet + head).
-  private bodyBlocked(wx: number, eyeY: number, wz: number): boolean {
+  // highest solid block's TOP surface (world y) in this column, near the player
+  private surfaceTop(wx: number, wz: number): number {
     const gx = Math.round(wx / BLOCK);
     const gz = Math.round(wz / BLOCK);
-    const feetY = Math.floor((eyeY - EYE) / BLOCK);
-    const headY = Math.floor((eyeY - EYE + PLAYER_H) / BLOCK);
-    return this.solidCell(gx, feetY, gz) || this.solidCell(gx, headY, gz);
-  }
-
-  // Topmost solid surface (world Y of its top face) at a world x/z.
-  private surfaceY(wx: number, wz: number): number {
-    const gx = Math.round(wx / BLOCK);
-    const gz = Math.round(wz / BLOCK);
-    let top = heightAt(gx, gz, SEED);
-    for (let y = top + 8; y >= 0; y--) {
+    let top = -1;
+    const base = heightAt(gx, gz, SEED);
+    for (let y = base + 8; y >= 0; y--) {
       if (this.blockAt(gx, y, gz) !== null) { top = y; break; }
     }
-    return (top + 1) * BLOCK; // top face of the highest block
+    return (top + 1) * BLOCK; // world y of the walkable surface
   }
 
   private tickSecond() {
@@ -468,7 +461,7 @@ export class VoxelForest {
     }
     if (this.ended) return;
 
-    // ---- horizontal movement with collision ----
+    // ---- horizontal movement with wall collision ----
     const speed = 8 * dt;
     const fwd = new THREE.Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw));
     const right = new THREE.Vector3(fwd.z, 0, -fwd.x);
@@ -478,36 +471,38 @@ export class VoxelForest {
     if (this.keys["KeyS"]) { nx += fwd.x * speed; nz += fwd.z * speed; }
     if (this.keys["KeyA"]) { nx -= right.x * speed; nz -= right.z * speed; }
     if (this.keys["KeyD"]) { nx += right.x * speed; nz += right.z * speed; }
-    if (!this.bodyBlocked(nx, this.pos.y, this.pos.z)) this.pos.x = nx;
-    if (!this.bodyBlocked(this.pos.x, this.pos.y, nz)) this.pos.z = nz;
+    // block movement if a wall is at knee OR head height (so you can't clip in)
+    const kneeY = this.pos.y - EYE + BLOCK * 0.5;
+    const headY = this.pos.y - EYE + PLAYER_H;
+    if (!this.solidWorld(nx, kneeY, this.pos.z) && !this.solidWorld(nx, headY, this.pos.z)) this.pos.x = nx;
+    if (!this.solidWorld(this.pos.x, kneeY, nz) && !this.solidWorld(this.pos.x, headY, nz)) this.pos.z = nz;
 
-    // ---- vertical physics: gravity + jump + ground/ceiling collision ----
-    this.velY -= GRAVITY * dt;
-    let nextY = this.pos.y + this.velY * dt;
+    // ---- vertical physics: gravity, jump, landing, head-bump ----
+    this.velocityY -= GRAVITY * dt;
+    let newY = this.pos.y + this.velocityY * dt;
 
-    const ground = this.surfaceY(this.pos.x, this.pos.z); // top face of terrain
-    const feetTargetEye = ground + EYE; // eye height when standing on surface
+    const feetSurface = this.surfaceTop(this.pos.x, this.pos.z); // walkable top
+    const standY = feetSurface + EYE; // eye height when standing on it
 
-    if (this.velY <= 0 && nextY <= feetTargetEye) {
-      // landed / standing on the surface
-      nextY = feetTargetEye;
-      this.velY = 0;
+    if (this.velocityY <= 0 && newY <= standY) {
+      // landed on the surface
+      newY = standY;
+      this.velocityY = 0;
       this.onGround = true;
     } else {
       this.onGround = false;
-      // ceiling bonk: if head would enter a solid block, stop upward motion
-      const headCellY = Math.floor((nextY - EYE + PLAYER_H) / BLOCK);
-      const gx = Math.round(this.pos.x / BLOCK);
-      const gz = Math.round(this.pos.z / BLOCK);
-      if (this.velY > 0 && this.solidCell(gx, headCellY, gz)) {
-        this.velY = 0;
-        nextY = this.pos.y;
+      // head-bump: if rising into a solid block, stop upward motion
+      if (this.velocityY > 0 && this.solidWorld(this.pos.x, newY - EYE + PLAYER_H, this.pos.z)) {
+        this.velocityY = 0;
+        newY = this.pos.y;
       }
     }
-    this.pos.y = nextY;
+    this.pos.y = newY;
 
+    // stream terrain if we crossed into a new chunk
     this.refreshChunks();
 
+    // ---- camera + lantern ----
     this.camera.position.set(this.pos.x, this.pos.y, this.pos.z);
     const dir = new THREE.Vector3(
       Math.sin(this.yaw) * Math.cos(this.pitch),
@@ -521,27 +516,31 @@ export class VoxelForest {
 
     this.updateAim();
 
+    // ---- creatures ----
     for (const cr of this.creatures) {
       const to = new THREE.Vector3(this.pos.x - cr.position.x, 0, this.pos.z - cr.position.z);
       const d = to.length();
       to.normalize();
       cr.position.x += to.x * (cr as any).speed * dt;
       cr.position.z += to.z * (cr as any).speed * dt;
-      cr.position.y = this.surfaceY(cr.position.x, cr.position.z) + BLOCK * 0.8;
+      cr.position.y = this.surfaceTop(cr.position.x, cr.position.z) + BLOCK * 0.8;
       cr.rotation.y = Math.atan2(to.x, to.z);
       if (d < 1.6) {
         this.health -= 34;
         this.stats.creaturesEvaded += 1;
         const ang = Math.random() * Math.PI * 2;
-        cr.position.set(this.pos.x + Math.cos(ang) * 28, cr.position.y, this.pos.z + Math.sin(ang) * 28);
+        const bx = this.pos.x + Math.cos(ang) * 28;
+        const bz = this.pos.z + Math.sin(ang) * 28;
+        cr.position.set(bx, this.surfaceTop(bx, bz) + BLOCK * 0.8, bz);
         if (this.health <= 0) this.end();
       }
     }
 
+    // ---- items ----
     for (let i = this.items.length - 1; i >= 0; i--) {
       const it = this.items[i];
       it.rotation.y += dt * 2;
-      const baseY = this.surfaceY(it.position.x, it.position.z) + BLOCK * 0.6;
+      const baseY = this.surfaceTop(it.position.x, it.position.z) + BLOCK * 0.5;
       it.position.y = baseY + Math.sin(performance.now() / 400 + i) * 0.2;
       const dx = it.position.x - this.pos.x;
       const dz = it.position.z - this.pos.z;
