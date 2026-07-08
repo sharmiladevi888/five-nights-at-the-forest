@@ -1,12 +1,13 @@
 import Phaser from "phaser";
 import type { RunStats } from "@/lib/score";
+import { buildSprites } from "./sprites";
 
 // A compact but real survival loop: block/voxel-styled top-down forest.
 // Player moves with WASD/arrows, battery drains, creatures hunt you,
 // items restore battery and add score. Survive the timer to clear a night;
 // 5 nights escalate. Getting caught = game over.
 export class ForestScene extends Phaser.Scene {
-  private player!: Phaser.GameObjects.Rectangle & { body: Phaser.Physics.Arcade.Body };
+  private player!: Phaser.Physics.Arcade.Image;
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private keys!: Record<string, Phaser.Input.Keyboard.Key>;
   private creatures!: Phaser.Physics.Arcade.Group;
@@ -38,17 +39,19 @@ export class ForestScene extends Phaser.Scene {
 
     this.cameras.main.setBackgroundColor("#0b1410");
 
-    // scatter "trees" (blocks) for voxel vibe
+    // Build all pixel-art textures before spawning anything.
+    buildSprites(this);
+
+    // scatter voxel trees for atmosphere
     for (let i = 0; i < 40; i++) {
       const x = Phaser.Math.Between(20, width - 20);
       const y = Phaser.Math.Between(20, height - 20);
-      this.add.rectangle(x, y, 16, 16, 0x1c3327);
+      this.add.image(x, y, "tree").setDepth(1);
     }
 
     // player
-    this.player = this.add.rectangle(width / 2, height / 2, 18, 18, 0x5fae7e) as any;
-    this.physics.add.existing(this.player);
-    this.player.body.setCollideWorldBounds(true);
+    this.player = this.physics.add.image(width / 2, height / 2, "player");
+    this.player.setCollideWorldBounds(true).setDepth(5);
 
     this.creatures = this.physics.add.group();
     this.items = this.physics.add.group();
@@ -56,7 +59,7 @@ export class ForestScene extends Phaser.Scene {
 
     this.physics.add.overlap(this.player, this.creatures, () => this.caught());
     this.physics.add.overlap(this.player, this.items, (_p, item) =>
-      this.collectItem(item as any)
+      this.collectItem(item as Phaser.Physics.Arcade.Image)
     );
 
     // input
@@ -81,27 +84,22 @@ export class ForestScene extends Phaser.Scene {
     const count = 2 + this.night; // more creatures each night
     const speed = 40 + this.night * 12; // faster each night
     for (let i = 0; i < count; i++) {
-      const c = this.add.rectangle(
+      const c = this.physics.add.image(
         Phaser.Math.Between(0, width),
         Phaser.Math.Between(0, height),
-        16,
-        16,
-        0x8b1a1a
+        "creature"
       );
-      this.physics.add.existing(c);
-      (c as any).body.setCollideWorldBounds(true);
+      c.setCollideWorldBounds(true).setDepth(4);
       (c as any).speed = speed;
       this.creatures.add(c);
     }
     for (let i = 0; i < 3; i++) {
-      const it = this.add.rectangle(
+      const it = this.physics.add.image(
         Phaser.Math.Between(20, width - 20),
         Phaser.Math.Between(20, height - 20),
-        10,
-        10,
-        0xffd166
+        "item"
       );
-      this.physics.add.existing(it);
+      it.setDepth(3);
       this.items.add(it);
     }
   }
@@ -125,7 +123,7 @@ export class ForestScene extends Phaser.Scene {
     }
   }
 
-  private collectItem(item: Phaser.GameObjects.Rectangle) {
+  private collectItem(item: Phaser.Physics.Arcade.Image) {
     item.destroy();
     this.battery = Math.min(100, this.battery + 25);
     this.stats.itemsCollected += 1;
@@ -152,7 +150,7 @@ export class ForestScene extends Phaser.Scene {
 
   update() {
     if (this.gameEnded) return;
-    const body = this.player.body;
+    const body = this.player.body as Phaser.Physics.Arcade.Body;
     const speed = 160;
     body.setVelocity(0);
 
