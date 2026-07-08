@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { isAdmin } from "@/lib/solana";
+import { sendRewardTokens } from "@/lib/airdrop";
 
-// Admin-only. Distributes reward amounts to the top-N players by score.
-// SPL transfer signing is stubbed where marked — wire ADMIN_SECRET_KEY +
-// spl-token transfer to make it live on devnet (see README).
+// Admin-only. Distributes reward tokens to the top-N players by score via
+// real on-chain SPL transfers (devnet or mainnet, per NEXT_PUBLIC_SOLANA_NETWORK).
 export async function POST(req: NextRequest) {
   const { adminWallet, topN = 10, amountPerRank = 1000 } = await req.json();
 
@@ -18,21 +18,48 @@ export async function POST(req: NextRequest) {
     take: topN,
   });
 
-  const results = [];
+  const results: Array<{
+    wallet: string;
+    amount: number;
+    txSignature?: string;
+    status: "sent" | "skipped" | "failed";
+    reason?: string;
+  }> = [];
+
   for (let i = 0; i < top.length; i++) {
     const p = top[i];
     // Higher ranks get more. Rank 1 = topN * amountPerRank.
     const amount = (topN - i) * amountPerRank;
 
-    // TODO(live): sign + send SPL transfer here using ADMIN_SECRET_KEY and
-    // @solana/spl-token transfer(); capture the real signature.
-    const txSignature = `devnet-sim-${p.id}`;
-
-    await prisma.airdrop.create({
-      data: { playerId: p.id, wallet: p.wallet, amount, txSignature },
+    // Idempotency: never pay the same wallet twice in a run/campaign.
+    const already = await prisma.airdrop.findFirst({
+      where: { wallet: p.wallet, amount, txSignature: { not: null } },
     });
-    results.push({ wallet: p.wallet, amount, txSignature });
+    if (already) {
+      results.push({ wallet: p.wallet, amount, status: "skipped", reason: "already sent" });
+      continue;
+    }
+
+    try {
+      const txSignature = await sendRewardTokens(p.wallet, amount);
+      await prisma.airdrop.create({
+        data: { playerId: p.id, wallet: p.wallet, amount, txSignature },
+      });
+      results.push({ wallet: p.wallet, amount, txSignature, status: "sent" });
+    } catch (err: any) {
+      // Record the failed attempt (no signature) so we have an audit trail.
+      await prisma.airdrop.create({
+        data: { playerId: p.id, wallet: p.wallet, amount, txSignature: null },
+      });
+      results.push({
+        wallet: p.wallet,
+        amount,
+        status: "failed",
+        reason: err?.message ?? "transfer failed",
+      });
+    }
   }
 
-  return NextResponse.json({ sent: results.length, results });
+  const sent = results.filter((r) => r.status === "sent").length;
+  return NextResponse.json({ sent, total: results.length, results });
 }
