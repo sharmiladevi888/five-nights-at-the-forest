@@ -3,10 +3,17 @@ import { prisma } from "@/lib/prisma";
 import { isAdmin } from "@/lib/solana";
 import { sendRewardTokens } from "@/lib/airdrop";
 
-// Admin-only. Distributes reward tokens to the top-N players by score via
-// real on-chain SPL transfers (devnet or mainnet, per NEXT_PUBLIC_SOLANA_NETWORK).
+// Admin-only. Distributes reward tokens to the top-N players by score.
+// When `dryRun` is true, NO tokens move and NOTHING is written to the DB —
+// it just returns exactly who would be paid and how much, so the admin can
+// eyeball the batch before committing real transfers.
 export async function POST(req: NextRequest) {
-  const { adminWallet, topN = 10, amountPerRank = 1000 } = await req.json();
+  const {
+    adminWallet,
+    topN = 10,
+    amountPerRank = 1000,
+    dryRun = true, // safe by default: you must explicitly opt in to real sends
+  } = await req.json();
 
   // Hard gate: only the configured admin wallet may trigger airdrops.
   if (!isAdmin(adminWallet)) {
@@ -18,6 +25,24 @@ export async function POST(req: NextRequest) {
     take: topN,
   });
 
+  // ---- DRY RUN: preview only, no chain writes, no DB writes ----
+  if (dryRun) {
+    const preview = top.map((p, i) => ({
+      rank: i + 1,
+      wallet: p.wallet,
+      highScore: p.highScore,
+      amount: (topN - i) * amountPerRank,
+    }));
+    const totalTokens = preview.reduce((sum, r) => sum + r.amount, 0);
+    return NextResponse.json({
+      dryRun: true,
+      recipients: preview.length,
+      totalTokens,
+      preview,
+    });
+  }
+
+  // ---- LIVE: real on-chain SPL transfers ----
   const results: Array<{
     wallet: string;
     amount: number;
@@ -28,10 +53,9 @@ export async function POST(req: NextRequest) {
 
   for (let i = 0; i < top.length; i++) {
     const p = top[i];
-    // Higher ranks get more. Rank 1 = topN * amountPerRank.
     const amount = (topN - i) * amountPerRank;
 
-    // Idempotency: never pay the same wallet twice in a run/campaign.
+    // Idempotency: never pay the same wallet/amount twice.
     const already = await prisma.airdrop.findFirst({
       where: { wallet: p.wallet, amount, txSignature: { not: null } },
     });
@@ -47,7 +71,6 @@ export async function POST(req: NextRequest) {
       });
       results.push({ wallet: p.wallet, amount, txSignature, status: "sent" });
     } catch (err: any) {
-      // Record the failed attempt (no signature) so we have an audit trail.
       await prisma.airdrop.create({
         data: { playerId: p.id, wallet: p.wallet, amount, txSignature: null },
       });
@@ -61,5 +84,5 @@ export async function POST(req: NextRequest) {
   }
 
   const sent = results.filter((r) => r.status === "sent").length;
-  return NextResponse.json({ sent, total: results.length, results });
+  return NextResponse.json({ dryRun: false, sent, total: results.length, results });
 }
